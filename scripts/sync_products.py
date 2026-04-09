@@ -1,30 +1,47 @@
 """
-BourbonLiquorStore.com — Daily Feed to Matrixify CSV
------------------------------------------------------
-Downloads the partner feed, filters American whiskey products,
-deduplicates by normalized title (keeps lowest price, image priority),
-and outputs a Matrixify-ready CSV for daily scheduled import.
+TequilaLiquorStore.com — Daily Feed Sync + Auto-Unpublish
+----------------------------------------------------------
+1. Downloads the partner feed
+2. Filters tequila-only products
+3. Outputs matrixify_update.csv (products to create/update)
+4. Compares against live Shopify products via API
+5. Outputs unpublish.csv (products missing from feed → Published: FALSE)
 
-Environment variables:
-  FEED_URL   https://www.liquorstore-online.com/gmcfeed/shopify_feed_bls.csv
+Environment variables (set as GitHub Actions secrets):
+  FEED_URL              Partner feed CSV URL
+  SHOPIFY_STORE         Your store handle (e.g. sendliquorgifts-com-1156)
+  SHOPIFY_CLIENT_ID     Shopify app Client ID
+  SHOPIFY_CLIENT_SECRET Shopify app Client Secret
 
-Output: output/matrixify_update.csv
+Output:
+  output/matrixify_update.csv   → import into Shopify via Matrixify
+  output/unpublish.csv          → import into Shopify via Matrixify to unpublish missing products
 """
 
 import csv
 import io
+import json
 import os
-import re
 import urllib.request
+import urllib.parse
 
-FEED_URL    = os.environ.get('FEED_URL', 'https://www.liquorstore-online.com/gmcfeed/shopify_feed_bls.csv')
-OUTPUT_FILE = 'output/matrixify_update.csv'
+FEED_URL       = os.environ.get('FEED_URL', 'https://www.liquorstore-online.com/gmcfeed/shopify_feed_bls.csv')
+STORE          = os.environ.get('SHOPIFY_STORE', 'bourbonliquorstore-com')
+CLIENT_ID      = os.environ.get('SHOPIFY_CLIENT_ID', '')
+CLIENT_SECRET  = os.environ.get('SHOPIFY_CLIENT_SECRET', '')
+BOURBON_CAT    = 'Bourbon'
+OUTPUT_DIR     = 'output'
+UPDATE_FILE    = f'{OUTPUT_DIR}/matrixify_update.csv'
+UNPUBLISH_FILE = f'{OUTPUT_DIR}/unpublish.csv'
 
-# Exclude these non-American whiskey products
-EXCLUDE_KEYWORDS = ['irish whiskey', 'irish whisky']
+# Products to never unpublish (e.g. gift cards not in the feed)
+EXCLUDE_PRODUCT_IDS = {'15072998359404'}  # Bourbon Liquor Store Gift Card
+
 
 def log(msg):
     print(msg, flush=True)
+
+# ─── Feed ────────────────────────────────────────────────────────────────────
 
 def download_feed(url):
     log(f"Downloading feed from {url}...")
@@ -35,44 +52,13 @@ def download_feed(url):
 
 def parse_feed(content):
     rows = list(csv.DictReader(io.StringIO(content)))
-    log(f"  Total products in feed: {len(rows):,}")
+    log(f"  Total rows in feed: {len(rows):,}")
     return rows
 
-def filter_products(rows):
-    filtered = []
-    skipped = 0
-    for row in rows:
-        title = row.get('Title', '').lower()
-        if any(kw in title for kw in EXCLUDE_KEYWORDS):
-            skipped += 1
-            continue
-        filtered.append(row)
-    log(f"  After filtering: {len(filtered):,} products ({skipped} excluded)")
-    return filtered
-
-def build_known_brands(rows):
-    return sorted(set(r['Vendor'].strip() for r in rows if r.get('Vendor','').strip()), key=len, reverse=True)
-
-def extract_brand(title, known_brands):
-    if ' - ' in title:
-        candidate = title.split(' - ')[0].strip()
-        if len(candidate) > 1:
-            return candidate
-    title_lower = title.lower()
-    for brand in known_brands:
-        if title_lower.startswith(brand.lower()):
-            return brand
-    words = title.split()
-    return ' '.join(words[:2]) if len(words) >= 2 else words[0] if words else 'Unknown'
-
-def normalize_title(t):
-    t = t.lower().strip()
-    t = re.sub(r'\s*[-–]\s*\d+(\.\d+)?\s*(ml|cl|l|oz)\b', '', t)
-    t = re.sub(r'\s+\d+(\.\d+)?\s*(ml|cl|l|oz)\b', '', t)
-    t = re.sub(r'\b(bourbon|whiskey|whisky|straight|kentucky|single|barrel|small|batch|blended|organic)\b', '', t)
-    t = re.sub(r'\s+', ' ', t).strip()
-    words = sorted(t.split())
-    return ' '.join(words)
+def filter_bourbon(rows):
+    out = [r for r in rows if 'Bourbon' in r.get('Product category', '') or 'Whiskey' in r.get('Product category', '') or 'Whisky' in r.get('Product category', '')]
+    log(f"  Bourbon products: {len(out):,}")
+    return out
 
 def get_style_tags(title):
     t = title.lower()
@@ -81,104 +67,154 @@ def get_style_tags(title):
         tags.append('single-barrel')
     if 'small batch' in t:
         tags.append('small-batch')
-    if 'wheated' in t:
-        tags.append('wheated')
-    if 'bottled in bond' in t:
-        tags.append('bottled-in-bond')
+    if 'straight' in t:
+        tags.append('straight-bourbon')
     if 'rye' in t:
         tags.append('rye')
     if 'tennessee' in t:
-        tags.append('tennessee')
-    if 'canadian' in t:
-        tags.append('canadian')
-    if 'moonshine' in t:
-        tags.append('moonshine')
-    if 'straight' in t:
-        tags.append('straight-bourbon')
+        tags.append('tennessee-whiskey')
+    if 'single malt' in t:
+        tags.append('single-malt')
     return ', '.join(tags)
 
-def get_published(status):
-    return 'TRUE' if status.lower() == 'active' else 'FALSE'
-
-def deduplicate(rows):
-    seen = {}
-    for row in rows:
-        norm = normalize_title(row.get('Title', ''))
-        try:
-            price = float(row.get('Variant Price', '') or 9999)
-        except:
-            price = 9999
-
-        if norm not in seen:
-            seen[norm] = (row, price)
-        else:
-            existing_row, existing_price = seen[norm]
-            has_image = bool(row.get('Image Src', '').strip())
-            existing_has_image = bool(existing_row.get('Image Src', '').strip())
-
-            if has_image and not existing_has_image:
-                seen[norm] = (row, price)
-            elif has_image == existing_has_image and price < existing_price:
-                seen[norm] = (row, price)
-
-    deduped = [r for r, p in seen.values()]
-    log(f"  After deduplication: {len(deduped):,} products")
-    return deduped
-
-def main():
-    log("=" * 60)
-    log("BourbonLiquorStore.com — Daily Feed Converter")
-    log("=" * 60)
-
-    content = download_feed(FEED_URL)
-    rows = parse_feed(content)
-    rows = filter_products(rows)
-    known_brands = build_known_brands(rows)
-
-    output_rows = []
-    skipped_no_image = 0
-
-    for row in rows:
+def build_update_rows(tequilas):
+    rows = []
+    skipped = 0
+    for row in tequilas:
         title = row.get('Title', '').strip()
-        if not title:
-            continue
         handle = row.get('URL handle', '').strip()
-        if not handle:
-            continue
-
         image = row.get('Product image URL', '').strip()
-        if not image:
-            skipped_no_image += 1
+        price = row.get('Price', '').strip()
+
+        if not title or not handle or not image:
+            skipped += 1
             continue
 
-        vendor = row.get('Vendor', '').strip()
-        if not vendor:
-            vendor = extract_brand(title, known_brands)
-
-        output_rows.append({
+        rows.append({
             'Handle':        handle,
             'Title':         title,
             'Type':          'Bourbon',
             'Tags':          get_style_tags(title),
-            'Vendor':        vendor,
-            'Published':     get_published(row.get('Status', 'active')),
-            'Variant Price': row.get('Price', '').strip(),
+            'Vendor':        row.get('Vendor', '').strip(),
+            'Published':     'TRUE',
+            'Variant Price': price,
             'Image Src':     image,
             'Variant SKU':   row.get('SKU', '').strip(),
         })
 
-    log(f"  Skipped (no image): {skipped_no_image}")
+    log(f"  Skipped (missing title/handle/image): {skipped}")
+    log(f"  Update rows: {len(rows):,}")
+    return rows
 
-    output_rows = deduplicate(output_rows)
+# ─── Shopify API ──────────────────────────────────────────────────────────────
 
-    os.makedirs('output', exist_ok=True)
-    fieldnames = ['Handle','Title','Type','Tags','Vendor','Published','Variant Price','Image Src','Variant SKU']
-    with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8') as f:
+def get_access_token():
+    log("Getting Shopify access token...")
+    url = f"https://{STORE}.myshopify.com/admin/oauth/access_token"
+    data = urllib.parse.urlencode({
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'grant_type': 'client_credentials'
+    }).encode()
+    req = urllib.request.Request(url, data=data, method='POST')
+    req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+    try:
+        with urllib.request.urlopen(req) as resp:
+            result = json.loads(resp.read())
+            token = result.get('access_token', '')
+            log(f"  Got access token: {'yes' if token else 'NO - check credentials'}")
+            return token
+    except Exception as e:
+        log(f"  Token error: {e}")
+        return None
+
+def get_all_shopify_handles(token):
+    log("Fetching all live products from Shopify...")
+    handles = {}
+    url = f"https://{STORE}.myshopify.com/admin/api/2024-01/products.json?limit=250&published_status=published&fields=id,handle,status"
+    headers = {'X-Shopify-Access-Token': token}
+
+    while url:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req) as resp:
+            link_header = resp.headers.get('Link', '')
+            body = json.loads(resp.read())
+
+        for p in body.get('products', []):
+            handles[p['handle']] = p['id']
+
+        # pagination
+        next_url = None
+        if 'rel="next"' in link_header:
+            for part in link_header.split(','):
+                if 'rel="next"' in part:
+                    next_url = part.strip().split(';')[0].strip('<> ')
+                    break
+        url = next_url
+
+    log(f"  Live published products in Shopify: {len(handles):,}")
+    return handles
+
+# ─── Unpublish ────────────────────────────────────────────────────────────────
+
+def normalize_handle(h):
+    return h.replace('.', '-')
+
+def build_unpublish_rows(feed_handles, shopify_handles):
+    # Normalize feed handles for comparison (dots -> dashes)
+    normalized_feed = {normalize_handle(h) for h in feed_handles}
+    missing = {
+        h: pid for h, pid in shopify_handles.items()
+        if normalize_handle(h) not in normalized_feed and str(pid) not in EXCLUDE_PRODUCT_IDS
+    }
+    log(f"  Products in Shopify but not in feed (to unpublish): {len(missing):,}")
+    rows = [{'Handle': h, 'Published': 'FALSE'} for h in missing]
+    return rows
+
+# ─── Write CSV ────────────────────────────────────────────────────────────────
+
+def write_csv(filepath, fieldnames, rows):
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(output_rows)
+        writer.writerows(rows)
+    log(f"  Written: {filepath} ({len(rows)} rows)")
 
-    log(f"\n✅ Done! {len(output_rows)} products written to {OUTPUT_FILE}")
+# ─── Main ─────────────────────────────────────────────────────────────────────
+
+def main():
+    log("=" * 60)
+    log("BourbonLiquorStore — Daily Sync + Auto-Unpublish")
+    log("=" * 60)
+
+    # Step 1: Download and process feed
+    content = download_feed(FEED_URL)
+    rows = parse_feed(content)
+    tequilas = filter_bourbon(rows)
+    update_rows = build_update_rows(tequilas)
+
+    # Feed handles set
+    feed_handles = {r['Handle'] for r in update_rows}
+
+    # Step 2: Write update CSV
+    update_fields = ['Handle', 'Title', 'Type', 'Tags', 'Vendor', 'Published', 'Variant Price', 'Image Src', 'Variant SKU']
+    write_csv(UPDATE_FILE, update_fields, update_rows)
+
+    # Step 3: Get Shopify live products and generate unpublish CSV
+    if CLIENT_ID and CLIENT_SECRET:
+        token = get_access_token()
+        if token:
+            shopify_handles = get_all_shopify_handles(token)
+            unpublish_rows = build_unpublish_rows(feed_handles, shopify_handles)
+            write_csv(UNPUBLISH_FILE, ['Handle', 'Published'], unpublish_rows)
+        else:
+            log("⚠️  Skipping unpublish step — could not get access token")
+    else:
+        log("⚠️  Skipping unpublish step — no Shopify credentials set")
+
+    log(f"\n✅ Done!")
+    log(f"   Products to update:    {len(update_rows)}")
 
 if __name__ == '__main__':
     main()

@@ -1,8 +1,8 @@
 """
-TequilaLiquorStore.com — Daily Feed Sync + Auto-Unpublish
+BourbonLiquorStore.com — Daily Feed Sync + Auto-Unpublish
 ----------------------------------------------------------
 1. Downloads the partner feed
-2. Filters tequila-only products
+2. Filters bourbon/whiskey products
 3. Outputs matrixify_update.csv (products to create/update)
 4. Compares against live Shopify products via API
 5. Outputs unpublish.csv (products missing from feed → Published: FALSE)
@@ -77,10 +77,21 @@ def get_style_tags(title):
         tags.append('single-malt')
     return ', '.join(tags)
 
-def build_update_rows(tequilas):
+def extract_brand_from_title(title):
+    """Extract brand name from product title when vendor field is empty."""
+    if ' - ' in title:
+        candidate = title.split(' - ')[0].strip()
+        if len(candidate) > 1:
+            return candidate
+    words = title.split()
+    if len(words) >= 2:
+        return ' '.join(words[:2])
+    return words[0] if words else ''
+
+def build_update_rows(bourbons):
     rows = []
     skipped = 0
-    for row in tequilas:
+    for row in bourbons:
         title = row.get('Title', '').strip()
         handle = row.get('URL handle', '').strip()
         image = row.get('Product image URL', '').strip()
@@ -95,7 +106,7 @@ def build_update_rows(tequilas):
             'Title':         title,
             'Type':          'Bourbon',
             'Tags':          get_style_tags(title),
-            'Vendor':        row.get('Vendor', '').strip(),
+            'Vendor':        row.get('Vendor', '').strip() or extract_brand_from_title(title),
             'Published':     'TRUE',
             'Variant Price': price,
             'Image Src':     image,
@@ -191,8 +202,8 @@ def main():
     # Step 1: Download and process feed
     content = download_feed(FEED_URL)
     rows = parse_feed(content)
-    tequilas = filter_bourbon(rows)
-    update_rows = build_update_rows(tequilas)
+    bourbons = filter_bourbon(rows)
+    update_rows = build_update_rows(bourbons)
 
     # Feed handles set
     feed_handles = {r['Handle'] for r in update_rows}

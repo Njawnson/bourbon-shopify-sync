@@ -19,6 +19,7 @@ Output:
 """
 
 import csv
+import html
 import io
 import json
 import os
@@ -35,7 +36,7 @@ UPDATE_FILE    = f'{OUTPUT_DIR}/matrixify_update.csv'
 UNPUBLISH_FILE = f'{OUTPUT_DIR}/unpublish.csv'
 
 # Products to never unpublish (e.g. gift cards not in the feed)
-EXCLUDE_PRODUCT_IDS = {'15072998359404'}  # Bourbon Liquor Store Gift Card
+EXCLUDE_HANDLES = {'bourbon-liquor-store-gift-card'}  # Bourbon Liquor Store Gift Card
 
 
 def log(msg):
@@ -176,7 +177,7 @@ def build_unpublish_rows(feed_handles, shopify_handles):
     normalized_feed = {normalize_handle(h) for h in feed_handles}
     missing = {
         h: pid for h, pid in shopify_handles.items()
-        if normalize_handle(h) not in normalized_feed and str(pid) not in EXCLUDE_PRODUCT_IDS
+        if normalize_handle(h) not in normalized_feed and h not in EXCLUDE_HANDLES
     }
     log(f"  Products in Shopify but not in feed (to unpublish): {len(missing):,}")
     rows = [{'Handle': h, 'Published': 'FALSE'} for h in missing]
